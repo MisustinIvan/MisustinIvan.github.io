@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>WaterfallArt | Spectrogram Generator</title>
+    <script src="wasm_exec.js"></script>
+    <style>
+        :root {
+            --orange: #ff8c00;
+            --black: #121212;
+            --gray: #1e1e1e;
+            --text: #e0e0e0;
+        }
+
+        body {
+            background-color: var(--black);
+            color: var(--text);
+            font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            min-height: 100vh;
+            margin: 0;
+            padding: 20px;
+        }
+
+        .container {
+            background-color: var(--gray);
+            padding: 2rem;
+            border-radius: 12px;
+            box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+            border-top: 4px solid var(--orange);
+            width: 100%;
+            max-width: 500px;
+        }
+
+        h1 {
+            color: var(--orange);
+            margin-top: 0;
+            text-align: center;
+            letter-spacing: 1px;
+            font-weight: 300;
+            text-transform: uppercase;
+        }
+
+        .input-group {
+            margin-bottom: 1.5rem;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 0.5rem;
+            font-size: 0.9rem;
+            color: var(--orange);
+            font-weight: 600;
+        }
+
+        input[type="number"],
+        input[type="file"] {
+            width: 100%;
+            padding: 10px;
+            background-color: var(--black);
+            border: 1px solid #333;
+            color: white;
+            border-radius: 4px;
+            box-sizing: border-box;
+            outline: none;
+            transition: border-color 0.3s;
+        }
+
+        input[type="number"]:focus {
+            border-color: var(--orange);
+        }
+
+        button {
+            width: 100%;
+            padding: 12px;
+            background-color: var(--orange);
+            border: none;
+            color: black;
+            font-weight: bold;
+            text-transform: uppercase;
+            border-radius: 4px;
+            cursor: pointer;
+            transition: transform 0.1s, opacity 0.3s;
+            margin-top: 1rem;
+        }
+
+        button:hover {
+            opacity: 0.9;
+        }
+
+        button:active {
+            transform: scale(0.98);
+        }
+
+        button:disabled {
+            background-color: #555;
+            cursor: not-allowed;
+        }
+
+        audio {
+            width: 100%;
+            margin-top: 2rem;
+            filter: invert(100%) hue-rotate(180deg) brightness(1.5); /* Make standard audio controls look okay on dark theme */
+        }
+
+        .status {
+            margin-top: 1rem;
+            font-size: 0.8rem;
+            text-align: center;
+            height: 1.2rem;
+        }
+
+        .settings-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 1rem;
+        }
+    </style>
+    <script>
+        const go = new Go();
+        let wasmLoaded = false;
+
+        WebAssembly.instantiateStreaming(fetch("main.wasm"), go.importObject).then((result) => {
+            go.run(result.instance);
+            wasmLoaded = true;
+            statusMsg.textContent = "WASM Ready";
+            btn.disabled = false;
+        }).catch(err => {
+            console.error(err);
+            statusMsg.textContent = "Error loading WASM";
+        });
+
+        async function process() {
+            const fileInput = document.getElementById('upload');
+            const statusMsg = document.getElementById('statusMsg');
+            const btn = document.getElementById('btn');
+
+            if (!fileInput.files.length) {
+                statusMsg.textContent = "Please select an image first.";
+                return;
+            }
+
+            btn.disabled = true;
+            statusMsg.textContent = "Generating audio... (Please wait)";
+
+            try {
+                const file = fileInput.files[0];
+                const arrayBuffer = await file.arrayBuffer();
+                const uint8Array = new Uint8Array(arrayBuffer);
+
+                const minFreq = parseFloat(document.getElementById('minFreq').value);
+                const maxFreq = parseFloat(document.getElementById('maxFreq').value);
+                const sampleRate = parseInt(document.getElementById('sampleRate').value);
+                const secondsPerStep = parseFloat(document.getElementById('secondsPerStep').value);
+
+                // Delay slightly to allow UI to update
+                await new Promise(r => setTimeout(r, 100));
+
+                const wavBytes = generate(uint8Array, minFreq, maxFreq, sampleRate, secondsPerStep);
+
+                if (typeof wavBytes === 'string') {
+                    throw new Error(wavBytes);
+                }
+
+                const blob = new Blob([wavBytes], { type: "audio/wav" });
+                const url = URL.createObjectURL(blob);
+                document.getElementById('audio').src = url;
+                statusMsg.textContent = "Done!";
+            } catch (e) {
+                console.error(e);
+                statusMsg.textContent = "Error: " + e.message;
+            } finally {
+                btn.disabled = false;
+            }
+        }
+    </script>
+</head>
+<body>
+    <div class="container">
+        <h1>WaterfallArt</h1>
+
+        <div class="input-group">
+            <label for="upload">Image Source</label>
+            <input type="file" id="upload" accept="image/*">
+        </div>
+
+        <div class="settings-grid">
+            <div class="input-group">
+                <label for="minFreq">Min Freq (Hz)</label>
+                <input type="number" id="minFreq" value="200" step="10">
+            </div>
+            <div class="input-group">
+                <label for="maxFreq">Max Freq (Hz)</label>
+                <input type="number" id="maxFreq" value="3000" step="100">
+            </div>
+            <div class="input-group">
+                <label for="sampleRate">Sample Rate</label>
+                <input type="number" id="sampleRate" value="44100" step="1000">
+            </div>
+            <div class="input-group">
+                <label for="secondsPerStep">Seconds / Row</label>
+                <input type="number" id="secondsPerStep" value="0.05" step="0.01">
+            </div>
+        </div>
+
+        <button id="btn" onclick="process()" disabled>Generate</button>
+        <div id="statusMsg" class="status">Loading WASM...</div>
+
+        <audio id="audio" controls></audio>
+    </div>
+</body>
+</html>

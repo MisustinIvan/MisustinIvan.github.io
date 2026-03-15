@@ -1,79 +1,145 @@
 package main
 
 import (
-	"flag"
+	"bytes"
 	"image"
 	_ "image/jpeg"
 	_ "image/png"
-	"log"
 	"math"
-	"os"
+	"syscall/js"
 
 	"github.com/go-audio/audio"
 	"github.com/go-audio/wav"
 )
 
-func main() {
-	imageFileName := flag.String("i", "", "the input image file path")
-	outputFileName := flag.String("o", "", "the output sound file path")
+// bufferWriteSeeker implements io.WriteSeeker for a memory buffer,
+// allowing the WAV encoder to update headers.
+type bufferWriteSeeker struct {
+	buf []byte
+	off int
+}
 
-	flag.Parse()
-
-	if *imageFileName == "" || *outputFileName == "" {
-		flag.PrintDefaults()
-		os.Exit(1)
+func (bws *bufferWriteSeeker) Write(p []byte) (n int, err error) {
+	end := bws.off + len(p)
+	if end > len(bws.buf) {
+		newBuf := make([]byte, end)
+		copy(newBuf, bws.buf)
+		bws.buf = newBuf
 	}
+	copy(bws.buf[bws.off:], p)
+	bws.off = end
+	return len(p), nil
+}
 
-	file, err := os.Open(*imageFileName)
+func (bws *bufferWriteSeeker) Seek(offset int64, whence int) (int64, error) {
+	var newOffset int64
+	switch whence {
+	case 0: // SeekStart
+		newOffset = offset
+	case 1: // SeekCurrent
+		newOffset = int64(bws.off) + offset
+	case 2: // SeekEnd
+		newOffset = int64(len(bws.buf)) + offset
+	}
+	if newOffset < 0 {
+		newOffset = 0
+	}
+	bws.off = int(newOffset)
+	return newOffset, nil
+}
+
+func (bws *bufferWriteSeeker) Bytes() []byte {
+	return bws.buf
+}
+
+func generate(this js.Value, inputs []js.Value) interface{} {
+	if len(inputs) < 5 {
+		return "Missing arguments: expected (data, minFreq, maxFreq, sampleRate, secondsPerColumn)"
+	}
+	inputJS := inputs[0]
+	length := inputJS.Get("length").Int()
+	imgData := make([]byte, length)
+	js.CopyBytesToGo(imgData, inputJS)
+
+	minFreq := inputs[1].Float()
+	maxFreq := inputs[2].Float()
+	sampleRate := inputs[3].Int()
+	secondsPerStep := inputs[4].Float()
+
+	img, _, err := image.Decode(bytes.NewReader(imgData))
 	if err != nil {
-		log.Fatal(err)
+		return "Decode error: " + err.Error()
 	}
-
-	img, _, err := image.Decode(file)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	bounds := img.Bounds()
-	w, h := bounds.Max.X, bounds.Max.Y
+	w, h := bounds.Dx(), bounds.Dy()
 
-	sampleRate := 44100
-	secondsPerColumn := 0.1
-	totalSamples := int(float64(w) * secondsPerColumn * float64(sampleRate))
-
-	outputFile, err := os.Create(*outputFileName)
-	if err != nil {
-		log.Fatal(err)
-	}
-	enc := wav.NewEncoder(outputFile, sampleRate, 16, 1, 1)
-	defer enc.Close()
-
+	totalSamples := int(float64(h) * secondsPerStep * float64(sampleRate))
 	data := make([]int, totalSamples)
 
-	minFreq, maxFreq := 0.0, 3000.0
-
 	sampleIdx := 0
-	for x := range w {
-		numSamplesInCol := int(secondsPerColumn * float64(sampleRate))
 
-		for range numSamplesInCol {
-			var mixedSample float64
+	// For SDR waterfalls (scrolling down):
+	// To see the image upright, we play the bottom rows first.
+	// Horizontal (X) maps to Frequency.
+	// Vertical (Y) maps to Time.
+	for y := h - 1; y >= 0; y-- {
+		numSamplesInStep := int(secondsPerStep * float64(sampleRate))
 
-			for y := range h {
-				r, g, b, _ := img.At(y, x).RGBA()
-				brightness := float64(r+g+b) / (3.0 * 65535.0)
-
-				freq := minFreq + (float64(h-y)/float64(h))*(maxFreq-minFreq)
-
-				t := float64(sampleIdx) / float64(sampleRate)
-				mixedSample += brightness * math.Sin(2*math.Pi*freq*t)
+		type tone struct {
+			freq float64
+			amp  float64
+		}
+		var tones []tone
+		for x := 0; x < w; x++ {
+			r, g, b, _ := img.At(bounds.Min.X+x, bounds.Min.Y+y).RGBA()
+			brightness := float64(r+g+b) / (3.0 * 65535.0)
+			if brightness > 0.01 {
+				// Map X to frequency range (left to right)
+				freq := minFreq + (float64(x)/float64(w))*(maxFreq-minFreq)
+				tones = append(tones, tone{freq, brightness})
 			}
+		}
 
-			data[sampleIdx] = int(mixedSample / float64(h) * 32767.0)
+		for i := 0; i < numSamplesInStep; i++ {
+			var mixedSample float64
+			t := float64(sampleIdx) / float64(sampleRate)
+
+			for _, tn := range tones {
+				mixedSample += tn.amp * math.Sin(2*math.Pi*tn.freq*t)
+			}
+			// Normalize by width as we mix 'w' possible frequencies
+			data[sampleIdx] = int(mixedSample / float64(w) * 32767.0)
 			sampleIdx++
+			if sampleIdx >= totalSamples {
+				break
+			}
+		}
+		if sampleIdx >= totalSamples {
+			break
 		}
 	}
 
-	buf := &audio.IntBuffer{Data: data, Format: &audio.Format{NumChannels: 1, SampleRate: sampleRate}}
-	enc.Write(buf)
+	ws := &bufferWriteSeeker{}
+	enc := wav.NewEncoder(ws, sampleRate, 16, 1, 1)
+
+	audioBuffer := &audio.IntBuffer{
+		Data:   data,
+		Format: &audio.Format{NumChannels: 1, SampleRate: sampleRate},
+	}
+
+	if err := enc.Write(audioBuffer); err != nil {
+		return "Write error: " + err.Error()
+	}
+	enc.Close()
+
+	outputBytes := ws.Bytes()
+	dst := js.Global().Get("Uint8Array").New(len(outputBytes))
+	js.CopyBytesToJS(dst, outputBytes)
+	return dst
+}
+
+func main() {
+	c := make(chan struct{}, 0)
+	js.Global().Set("generate", js.FuncOf(generate))
+	<-c
 }
